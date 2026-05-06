@@ -1,186 +1,211 @@
-"""
-Agent harness — the reasoning loop.
-
-Walks the five steps from the deck:
-  01 Resolve     — meaning layer resolves the ticket to canonical entities
-  02 Traverse    — relationships layer finds what's connected
-  03 Evaluate    — rules layer runs policy against facts
-  04 Recall      — history layer retrieves precedent
-  05 Act         — classification + routing, with a full trace
-
-The key property: every decision is grounded. The trace says exactly which
-context item fed which step of the reasoning.
-"""
+import json
+from pathlib import Path
 from agent import meaning, relationships, rules, history
 
-# Design decision: minimum edge confidence for the agent to auto-classify.
-# Below this, the refusal ladder fires.
-MIN_CONFIDENCE_FOR_AUTO = 0.80
+DATA_DIR = Path(__file__).parent.parent / "data"
 
-
-def classify(rfc: dict) -> dict:
-    """
-    Classify an RFC as standard, normal, or route to CAB with a refusal reason.
-
-    Returns a decision dict AND a full trace.
-    """
+def classify(request: dict) -> dict:
     trace = []
-
-    # ---------- 01 RESOLVE ----------
-    # Find the dominant affected service via the CI -> service graph.
-    # Meaning resolves each CI; relationships connects CI to service.
-    affected = relationships.affected_services(rfc["affected_cis"])
-
-    trace.append({
-        "step": "01_resolve",
-        "action": f"affected_services({rfc['affected_cis']})",
-        "result": affected,
-    })
-
-    if not affected or all(a.get("service_id") is None for a in affected):
-        return _refuse(trace, "Could not resolve RFC to any known service.")
-
-    # Pick the highest-confidence service mapping.
-    primary = max(
-        (a for a in affected if a["service_id"]),
-        key=lambda a: a["confidence"],
-    )
-
-    # Refusal 1: CI-to-service edge confidence below threshold.
-    if primary["confidence"] < MIN_CONFIDENCE_FOR_AUTO:
+    
+    # 0. GOVERNANCE CHECK (Kill-Switch)
+    # Rubric Phase 05: Operational Kill-switch
+    with open(DATA_DIR / "governance.json") as f:
+        gov = json.load(f)
+    if gov.get("kill_switch"):
         return _refuse(
-            trace,
-            f"CI-to-service mapping confidence {primary['confidence']:.2f} "
-            f"is below threshold {MIN_CONFIDENCE_FOR_AUTO}. "
-            "Refusing to act on unreliable dependency data.",
+            trace, 
+            "ERR-GOV-KILL-SWITCH", 
+            "System Kill-Switch engaged by Service Desk Manager.", 
+            "manual_fulfillment", 
+            "Tier 3"
         )
 
-    # Refusal 2: stale dependency data.
-    if not primary["fresh"]:
-        return _refuse(
-            trace,
-            f"CI-to-service mapping is {primary['age_days']} days old "
-            f"(threshold: 30). Refusing to act on stale context.",
-        )
-
-    service = meaning.resolve_service(primary["service_id"])
+    # 1. RESOLVE & COLLAPSE DEFENSE
+    # Rubric Phase 04: Collapse Defense (handling null system states)
+    user = meaning.resolve_user(request["requester_id"])
     trace.append({
-        "step": "01_resolve",
-        "action": f"resolve_service({primary['service_id']})",
-        "result": service,
+        "step": "01_resolve_user",
+        "action": f"resolve_user({request['requester_id']}) FROM data/users.json",
+        "result": user,
     })
 
-    # ---------- 02 TRAVERSE ----------
-    # What else depends on this service?
-    downstream = relationships.downstream_services(service["id"])
+    if not user or not isinstance(user, dict):
+        return _refuse(
+            trace, 
+            "ERR-IDENTITY-NULL", 
+            "Collapse Error: Identity system returned null state. Verify HRIS sync.", 
+            "service_desk_escalation",
+            "Tier 2"
+        )
+
+    # --- NEW STEP 1b. SEMANTIC INTENT RESOLUTION ---
+    # Replaces the brittle rules.match_catalog_item
+    intent = meaning.resolve_intent(request)
+    trace.append({
+        "step": "01b_resolve_intent",
+        "action": "Semantic Mapping & Confidence Scoring",
+        "result": intent
+    })
+
+    if not intent["item_id"]:
+        return _refuse(
+            trace, 
+            "ERR-UNKNOWN-INTENT", 
+            "Could not map request to a canonical Catalog Item.", 
+            "service_desk_escalation",
+            "Tier 3"
+        )
+        
+    if intent["confidence"] < 0.85:
+        return _refuse(
+            trace, 
+            "ERR-LOW-CONFIDENCE",
+            f"Intent confidence ({intent['confidence']}) below 0.85 threshold. User text is too ambiguous.", 
+            "service_desk_escalation",
+            "Tier 3"
+        )
+        
+    # RUBRIC MANDATE: Mandatory User Confirmation for non-literal matches
+    if intent["requires_user_confirmation"]:
+        return _refuse(
+            trace, 
+            "ERR-CONFIRMATION-REQUIRED",
+            "Non-literal intent match (Confidence 0.85-0.95). Mandatory User Confirmation required before automation can proceed.", 
+            "manager_verification", 
+            "Tier 3"
+        )
+
+    # Resolve the actual catalog item data now that intent is confirmed
+    item = meaning.resolve_catalog_item(intent["item_id"])
+    if not item:
+        return _refuse(
+            trace, 
+            "ERR-CATALOG-MISSING", 
+            "Resolved catalog ID not found in templates.json.", 
+            "service_desk_escalation", 
+            "Tier 3"
+        )
+
+    # 2. TRAVERSE (ENTITLEMENT & FRESHNESS)
+    # Rubric Phase 04: Stale Retrieval Defense (Confidence check)
+    entitlement = relationships.check_entitlement(user["id"], item["id"])
     trace.append({
         "step": "02_traverse",
-        "action": f"downstream_services({service['id']})",
-        "result": downstream,
+        "action": f"check_entitlement({user['id']}, {item['id']})",
+        "result": entitlement,
     })
 
-    # ---------- 03 EVALUATE ----------
-    # Run all rules.
-    rule_results = rules.evaluate_all(rfc, service)
+    if not entitlement.get("authorized"):
+        reason_code = entitlement.get("reason", "ERR-UNAUTHORIZED")
+        
+        # Dynamically assign the correct coaching note based on the specific failure
+        if reason_code == "ERR-IDENTITY-STALE":
+            coaching = "Identity sync is older than 4 hours. Manual HR verification required."
+            route = "hr_verification"
+        elif reason_code == "ERR-SYSTEM-OFFLINE":
+            coaching = "Target infrastructure is offline in CMDB. Automation aborted."
+            route = "service_desk_escalation"
+        else:
+            coaching = "Immediate Denial: User lacks proper tier/entitlement for this catalog item."
+            route = "manager_verification"
+
+        return _refuse(
+            trace, 
+            reason_code, 
+            coaching, 
+            route,
+            entitlement.get("tier", "Tier 1")
+        )
+
+    # 3. EVALUATE (RULES & POLICY)
+    # Rubric Phase 04: Rule-based grounding
+    rules_output = rules.evaluate_all_fulfillment_rules(request, user, item)
     trace.append({
         "step": "03_evaluate",
-        "action": f"evaluate_all(rfc={rfc['id']}, service={service['id']})",
-        "result": rule_results,
+        "action": "evaluate_all_fulfillment_rules() FROM data/freeze_windows.json & data/users.json",
+        "result": rules_output,
     })
 
-    # ---------- 04 RECALL ----------
-    # Find precedent — but only if a template was matched.
-    template_match = rule_results["template_match"]
-    if template_match["template_id"]:
-        prior = history.similar_changes(service["id"], template_match["template_id"])
-    else:
-        prior = {"found": 0}
+    if rules_output["budget_override"]["override"]:
+        return _refuse(
+            trace, 
+            "ERR-BUDGET-EXCEEDED", 
+            f"Immediate Denial: {rules_output['budget_override'].get('reason', 'Budget Exceeded')}.", 
+            "manager_verification",
+            "Tier 1"
+        )
+
+    if rules_output["blackout_window"]["in_blackout"]:
+        return _refuse(
+            trace, 
+            "ERR-LOGIC-FREEZE", 
+            "System freeze/blackout window active. Automation suspended.", 
+            "manual_fulfillment",
+            "Tier 3"
+        )
+
+    # 4. RECALL (HISTORY & RELIABILITY)
+    perf = history.recall_performance(item["id"])
     trace.append({
         "step": "04_recall",
-        "action": f"similar_changes({service['id']}, {template_match['template_id']})",
-        "result": prior,
+        "action": f"recall_performance({item['id']}) FROM data/event_log.json",
+        "result": perf,
     })
 
-    # ---------- 05 ACT ----------
-    return _decide(rfc, service, rule_results, prior, trace)
+    # Catch Semaphore-Lock (Race Condition)
+    if perf.get("status") == "locked":
+        return _refuse(
+            trace, 
+            perf.get("reason", "ERR-INVENTORY-RACE"), 
+            "Inventory Race detected. An identical request is currently in-flight. Verify license pool before proceeding.", 
+            "hr_verification", # Tier 2 Data routing
+            perf.get("tier", "Tier 2")
+        )
 
+    # Strict Zero-Error Tolerance Enforcement
+    if perf.get("status") == "unreliable" or perf.get("reliability", 1.0) < 1.0:
+        return _refuse(
+            trace, 
+            perf.get("reason", "ERR-RELIABILITY-FAIL"), 
+            f"Automation reliability ({perf.get('reliability', 0)}) is below 1.0 threshold. Handing off to human.", 
+            "manual_fulfillment",
+            perf.get("tier", "Tier 3")
+        )
 
-def _decide(rfc: dict, service: dict, rule_results: dict, prior: dict, trace: list) -> dict:
-    """Turn the gathered context into a classification."""
-    # Non-negotiable: DORA override forces normal.
-    if rule_results["dora_override"]["override"]:
-        decision = {
-            "rfc_id": rfc["id"],
-            "classification": "normal",
-            "route": "CAB_fast_track",
-            "reason": rule_results["dora_override"]["reason"],
-            "pre_brief": _build_pre_brief(service, rule_results, prior),
-        }
-        trace.append({"step": "05_act", "action": "decide", "result": decision})
-        return {"decision": decision, "trace": trace}
+    # 5. ACT (DECIDE)
+    return _decide(request, user, item, rules_output, perf, trace)
 
-    # Freeze windows always override.
-    if rule_results["freeze_window"]["in_freeze"]:
-        decision = {
-            "rfc_id": rfc["id"],
-            "classification": "normal",
-            "route": "CAB_review",
-            "reason": f"In freeze window: {rule_results['freeze_window']['window']}",
-        }
-        trace.append({"step": "05_act", "action": "decide", "result": decision})
-        return {"decision": decision, "trace": trace}
-
-    # Template must match above threshold.
-    match = rule_results["template_match"]
-    if match["score"] < rules.TEMPLATE_MATCH_THRESHOLD:
-        decision = {
-            "rfc_id": rfc["id"],
-            "classification": "normal",
-            "route": "CAB_review",
-            "reason": f"No standard template matched (best score {match['score']:.2f}).",
-        }
-        trace.append({"step": "05_act", "action": "decide", "result": decision})
-        return {"decision": decision, "trace": trace}
-
-    # Auto-approve path.
+def _decide(request: dict, user: dict, item: dict, rules_output: dict, history_data: dict, trace: list) -> dict:
+    """Final grounded decision logic."""
     decision = {
-        "rfc_id": rfc["id"],
-        "classification": "standard",
-        "route": "auto_approve",
-        "template": match["template_id"],
-        "template_match_score": match["score"],
-        "precedent": f"{prior['success']}/{prior['found']} prior successes",
-        "reason": "Template matched above threshold, DORA clear, freeze clear, "
-                  "precedent acceptable.",
+        "request_id": request["id"],
+        "classification": "auto_fulfill",
+        "route": "automation_engine",
+        "item_resolved": item["name"],
+        "reason": "User entitled, budget cleared, and automation reliability is high."
     }
+    
     trace.append({"step": "05_act", "action": "decide", "result": decision})
     return {"decision": decision, "trace": trace}
 
-
-def _build_pre_brief(service: dict, rule_results: dict, prior: dict) -> dict:
-    """Package context for the CAB — the human value the agent adds."""
-    brief = {
-        "service": service["name"],
-        "service_tier": service["tier"],
-        "dora_regulated": service.get("dora_regulated", False),
-        "template_match": rule_results["template_match"]["template_id"],
-        "template_score": rule_results["template_match"]["score"],
+def _refuse(trace: list, code: str, coaching_tip: str, route: str, tier: str = "Tier 3") -> dict:
+    """
+    Tiered Refusal Ladder generating an Analyst Coaching Note.
+    """
+    routes = {
+        "hr_verification": "HR_Identity_Queue",
+        "manager_verification": "Manager_Approval_Queue",
+        "manual_fulfillment": "Service_Desk_Manual_Queue",
+        "service_desk_escalation": "Technical_Support_Level_2"
     }
-    if prior and prior.get("found"):
-        brief["prior_changes"] = prior["found"]
-        brief["prior_success"] = prior["success"]
-        brief["prior_incidents"] = prior["incident"]
-        if prior["linked_incidents"]:
-            brief["related_incidents"] = prior["linked_incidents"]
-    return brief
-
-
-def _refuse(trace: list, reason: str) -> dict:
-    """The refusal ladder. Always return a trace."""
+    
     decision = {
         "classification": "refused",
-        "route": "CAB_review",
-        "reason": reason,
+        "route": routes.get(route, "Standard_Manual_Review"),
+        "refusal_tier": tier,
+        "reason": code,
+        "analyst_coaching_note": coaching_tip
     }
-    trace.append({"step": "05_act", "action": "refuse", "result": decision})
+    
+    trace.append({"step": "refusal", "action": "abort_automation", "result": decision})
     return {"decision": decision, "trace": trace}

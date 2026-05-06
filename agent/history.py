@@ -1,47 +1,57 @@
 """
-History layer — temporal recall.
-
-This module answers: "has this kind of change happened before, and what happened?"
-The agent uses this to attach precedent to its classification — a standard change
-template match plus a clean history of 10 prior successes is much stronger evidence
-than a template match alone.
+History layer — Semaphore-Locking & Reliability Gating.
+Answers: "Is this item currently locked by an in-flight request, 
+and is its historical automation reliability at 100%?"
 """
 import json
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-
-def _load_events() -> list[dict]:
-    with open(DATA_DIR / "event_log.json") as f:
-        return json.load(f)["events"]
-
-
-def similar_changes(service_id: str, template_id: str, k: int = 10) -> dict:
+def recall_performance(item_id: str) -> dict:
     """
-    Return the k most recent RFCs for this (service, template) pair.
-
-    Also summarize outcomes — how many succeeded, how many caused incidents.
-    That summary is what actually feeds the agent's decision.
+    Search historical events to calculate the success rate of the automation,
+    and scan for 'in_progress' states to prevent Inventory Race Conditions.
     """
-    events = _load_events()
-    matches = [
-        e for e in events
-        if e["type"] == "rfc_closed"
-        and e.get("service_id") == service_id
-        and e.get("template_id") == template_id
-    ]
-    matches.sort(key=lambda e: e["timestamp"], reverse=True)
-    matches = matches[:k]
+    file_path = DATA_DIR / "event_log.json"
+    
+    if not file_path.exists():
+        return {"reliability": 1.0, "count": 0, "status": "no_history"}
 
-    success_count = sum(1 for e in matches if e["outcome"] == "success")
-    incident_count = sum(1 for e in matches if e["outcome"] == "incident")
-    linked_incidents = [e["linked_incident"] for e in matches if "linked_incident" in e]
+    with open(file_path) as f:
+        events = json.load(f).get("events", [])
+
+    # 1. SEMAPHORE-LOCKING (In-Flight Check)
+    # Scan for any events currently "in_progress" for this specific item
+    in_flight = [e for e in events if e.get("template_id") == item_id and e.get("state") == "in_progress"]
+    
+    if in_flight:
+        return {
+            "status": "locked",
+            "reliability": 1.0,
+            "reason": "ERR-INVENTORY-RACE",
+            "tier": "Tier 2" # Maps to Identity/Data Verify queue
+        }
+
+    # 2. STRICT RELIABILITY GATING (0% False Approval Mandate)
+    relevant = [e for e in events if e.get("template_id") == item_id and e.get("state") != "in_progress"]
+    
+    if not relevant:
+        return {"reliability": 1.0, "count": 0, "status": "no_history"}
+
+    successes = [e for e in relevant if e.get("outcome") == "SUCCESS"]
+    reliability = len(successes) / len(relevant)
+    
+    if reliability < 1.0:
+        return {
+            "status": "unreliable",
+            "reliability": round(reliability, 2),
+            "reason": "ERR-RELIABILITY-FAIL",
+            "tier": "Tier 3" # Drops to standard Service Desk manual review
+        }
 
     return {
-        "found": len(matches),
-        "success": success_count,
-        "incident": incident_count,
-        "linked_incidents": linked_incidents,
-        "most_recent": matches[0] if matches else None,
+        "status": "reliable", 
+        "reliability": 1.0, 
+        "count": len(relevant)
     }

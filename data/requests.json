@@ -1,0 +1,36 @@
+{
+  "requests": [
+    {
+      "id": "SR-9812",
+      "title": "Certificate rotation for internal-dashboard",
+      "description": "Routine TLS cert rotation for internal-dashboard. Expiring in 14 days.",
+      "requester_id": "logan.student",
+      "submitted_at": "2026-04-21T09:00:00Z",
+      "item_id": "TPL-CERT-ROTATE-STD"
+    },
+    {
+      "id": "SR-9847",
+      "title": "Certificate rotation for payment-api",
+      "description": "TLS cert rotation for payment-api. Expiring in 7 days.",
+      "requester_id": "bob.intern",
+      "submitted_at": "2026-04-21T10:30:00Z",
+      "item_id": "TPL-CERT-ROTATE-STD"
+    },
+    {
+      "id": "SR-9903",
+      "title": "Standard Software License Request",
+      "description": "Requesting access to JetBrains IDE for project work.",
+      "requester_id": "carol.manager",
+      "submitted_at": "2026-04-21T11:00:00Z",
+      "item_id": "TPL-SOFT-REQ-STD"
+    },
+    {
+      "id": "SR-9999",
+      "title": "Marketing Site Update",
+      "description": "TLS cert rotation for marketing-site.",
+      "requester_id": "bob.intern",
+      "submitted_at": "2026-04-22T14:00:00Z",
+      "item_id": "TPL-CERT-ROTATE-STD"
+    }
+  ]
+}

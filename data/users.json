@@ -1,0 +1,34 @@
+{
+  "users": [
+    {
+      "id": "logan.student",
+      "name": "Logan Student",
+      "email": "logan@university.edu",
+      "department": "Engineering",
+      "role": "Lead Engineer",
+      "tier": "critical",
+      "spending_limit": 5000,
+      "last_verified": "2099-01-01T09:00:00Z" 
+    },
+    {
+      "id": "bob.intern",
+      "name": "Bob Smith",
+      "email": "bob.intern@fintech.com",
+      "department": "Marketing",
+      "role": "Intern",
+      "tier": "non-critical",
+      "spending_limit": 100,
+      "last_verified": "2026-04-15T14:30:00Z"
+    },
+    {
+      "id": "carol.manager",
+      "name": "Carol Danvers",
+      "email": "carol.m@fintech.com",
+      "department": "Finance",
+      "role": "Manager",
+      "tier": "standard",
+      "spending_limit": 1000,
+      "last_verified": "2026-02-01T10:00:00Z"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+    "last_audit_date":  "2026-04-22",
+    "kill_switch":  false,
+    "system_owner":  "Service Desk Manager",
+    "notes":  "If kill_switch is true, the harness will bypass automation and route to manual review."
+}

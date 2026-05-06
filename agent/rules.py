@@ -1,87 +1,63 @@
 """
-Rules layer — policy-as-code.
-
-This module answers: "given the facts, what rules apply, and with what result?"
-Rules are layered:
-  - TEMPLATE rules (defeasible) — can approve a standard change
-  - OVERRIDE rules (non-negotiable) — can force a change to normal regardless
-
-The DORA override is the canonical example: even a perfect template match
-cannot auto-approve a change to a DORA-regulated service.
-
-In production, these would be Rego policies evaluated by OPA.
-Here they are Python functions — the structure is what matters.
+Rules layer — Policy-as-Code.
+Evaluates fulfillment-specific constraints like budget and maintenance windows.
+Simulates an Open Policy Agent (OPA) / Rego evaluation layer by decoupling 
+hardcoded logic and strictly relying on the declarative JSON configurations.
 """
 import json
-from datetime import datetime, timezone
 from pathlib import Path
-from agent.meaning import all_templates
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-# Match threshold — part of the design, not the data.
-TEMPLATE_MATCH_THRESHOLD = 0.60
-
-
-def match_template(rfc: dict, service: dict) -> dict:
+def evaluate_all_fulfillment_rules(request: dict, user: dict, item: dict) -> dict:
     """
-    Score the RFC against every template and pick the best match.
-
-    Returns the best template with a score in [0, 1].
-    A score below threshold means no template applies — route to CAB.
+    The main entry point called by harness.py.
+    Checks blackout windows (using request time, not system time) and spending limits.
     """
-    title = rfc["title"].lower()
-    templates = all_templates()
+    return {
+        "blackout_window": _check_blackouts(request),
+        "budget_override": _check_budget(user, item)
+    }
 
-    best = {"template_id": None, "score": 0.0, "template": None}
-    for tpl in templates:
-        if service["tier"] not in tpl["allowed_service_tiers"]:
-            continue
-        # Simple keyword match — production would use NLP / embeddings.
-        hits = sum(1 for pat in tpl["match_patterns"] if pat in title)
-        score = min(1.0, hits / max(1, len(tpl["match_patterns"])) + (0.4 if hits > 0 else 0.0))
-        if score > best["score"]:
-            best = {"template_id": tpl["id"], "score": score, "template": tpl}
-    return best
-
-
-def check_freeze_window(submitted_at: str) -> dict:
-    """Is the RFC submitted during an active freeze window?"""
+def _check_blackouts(request: dict) -> dict:
+    """
+    Dynamic Freeze Windows: Checks if the request's submitted_at time 
+    falls within a restricted window.
+    
+    Fixes the 'Race Condition' vulnerability of checking datetime.utcnow()
+    which would allow users to 'beat the clock' or bypass freezes due to timezone delays.
+    """
     with open(DATA_DIR / "freeze_windows.json") as f:
-        data = json.load(f)
+        windows = json.load(f).get("freeze_windows", [])
+    
+    # Use the immutable submitted_at timestamp from the request itself
+    submitted_at = request.get("submitted_at")
+    
+    if not submitted_at:
+        # Failsafe if request is malformed
+        return {"in_blackout": False}
+        
+    for window in windows:
+        if window["start"] <= submitted_at <= window["end"]:
+            return {
+                "in_blackout": True, 
+                "reason": f"System freeze/blackout active: {window.get('name')} - {window.get('reason')}"
+            }
+            
+    return {"in_blackout": False}
 
-    now = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
-    for fw in data["freeze_windows"]:
-        start = datetime.fromisoformat(fw["start"].replace("Z", "+00:00"))
-        end = datetime.fromisoformat(fw["end"].replace("Z", "+00:00"))
-        if start <= now <= end:
-            return {"in_freeze": True, "window": fw["name"], "reason": fw["reason"]}
-
-    return {"in_freeze": False}
-
-
-def check_dora_override(service: dict) -> dict:
+def _check_budget(user: dict, item: dict) -> dict:
     """
-    The DORA rule: if a change touches a DORA-regulated service, the classification
-    is FORCED to normal regardless of template match.
-
-    This is a non-negotiable override. Regulatory context overrides operational efficiency.
-    Always.
+    Multi-Attribute Budget Check: Compares item cost against user spending limit.
+    Enforces the Tier 1 Immediate Denial guardrail.
     """
-    if service.get("dora_regulated", False):
+    cost = item.get("estimated_cost", 0)
+    limit = user.get("spending_limit", 0)
+    
+    if cost > limit:
         return {
-            "override": True,
-            "rule": "DORA-CRITICAL-FUNCTION",
-            "reason": f"Service {service['id']} ({service['name']}) is DORA-regulated. "
-                      f"All changes to this service require CAB review.",
+            "override": True, 
+            "reason": f"Cost (${cost}) exceeds user's allocated limit (${limit})",
+            "tier": "Tier 1" # Enforces the Immediate Denial requirement
         }
     return {"override": False}
-
-
-def evaluate_all(rfc: dict, service: dict) -> dict:
-    """Run every rule for this RFC/service pair and return a consolidated result."""
-    return {
-        "template_match": match_template(rfc, service),
-        "freeze_window": check_freeze_window(rfc["submitted_at"]),
-        "dora_override": check_dora_override(service),
-    }

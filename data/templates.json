@@ -1,28 +1,20 @@
 {
-  "templates": [
-    {
-      "id": "TPL-CERT-ROTATE-STD",
-      "name": "Certificate Rotation (Standard)",
-      "description": "Rotate an expiring TLS certificate using the automated rotation pipeline.",
-      "match_patterns": ["certificate", "cert rotation", "tls", "ssl renewal"],
-      "allowed_service_tiers": ["critical", "standard", "non-critical"],
-      "version": 7
-    },
-    {
-      "id": "TPL-LOG-ROTATE",
-      "name": "Log Rotation Config",
-      "description": "Adjust log rotation frequency or retention.",
-      "match_patterns": ["log rotation", "logrotate", "log retention"],
-      "allowed_service_tiers": ["standard", "non-critical"],
-      "version": 3
-    },
-    {
-      "id": "TPL-MINOR-LIB-UPGRADE",
-      "name": "Minor Library Upgrade",
-      "description": "Patch-version upgrade of an approved library.",
-      "match_patterns": ["patch upgrade", "library patch", "minor upgrade"],
-      "allowed_service_tiers": ["standard", "non-critical"],
-      "version": 2
-    }
-  ]
+    "templates": [
+        {
+            "id": "TPL-CERT-ROTATE-STD",
+            "name": "Standard Certificate Renewal Request",
+            "canonical_sku": "SKU_TLS_CERT_ROTATION_V2",
+            "allowed_service_tiers": ["critical", "standard", "non-critical"],
+            "estimated_cost": 250,
+            "match_patterns": ["certificate", "cert rotation", "tls", "ssl renewal"]
+        },
+        {
+            "id": "TPL-SOFT-REQ-STD",
+            "name": "Standard Software License Request",
+            "canonical_sku": "SKU_VISIO_PRO_2024",
+            "allowed_service_tiers": ["standard", "non-critical"],
+            "estimated_cost": 150,
+            "match_patterns": ["software", "license", "jetbrains", "ide", "install", "diagram", "diagramming tool"]
+        }
+    ]
 }

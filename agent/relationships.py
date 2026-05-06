@@ -1,106 +1,103 @@
 """
-Relationships layer — the knowledge graph.
+Relationships layer — Identity, Entitlement & Heartbeat.
 
-This module answers: "how do these entities connect?"
-Edges carry confidence scores; stale or low-confidence edges are a signal,
-not a failure.
-
-In production this would be Neo4j. Here it is NetworkX loaded from JSON.
+Answers: "Is this user legally entitled to this item right now, 
+and is the target infrastructure healthy enough to receive it?"
 """
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-import networkx as nx
+from agent.meaning import resolve_user, resolve_catalog_item
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-# Thresholds — part of the context layer's design, not the data.
-MIN_EDGE_CONFIDENCE = 0.80
-MAX_EDGE_AGE_DAYS = 30
+# Phase 01 Mandate: Identity sync must be less than 4 hours old.
+MAX_DATA_AGE_HOURS = 4  
 
-
-def _build_graph() -> nx.DiGraph:
-    """Build the graph from the CMDB snapshot."""
-    with open(DATA_DIR / "cmdb.json") as f:
-        cmdb = json.load(f)
-
-    G = nx.DiGraph()
-
-    for ci in cmdb["cis"]:
-        G.add_node(ci["id"], kind="ci", **ci)
-
-    for edge in cmdb["ci_service_edges"]:
-        G.add_edge(
-            edge["ci_id"],
-            edge["service_id"],
-            kind="ci_to_service",
-            confidence=edge["confidence"],
-            last_verified=edge["last_verified"],
-        )
-
-    for dep in cmdb["service_dependencies"]:
-        G.add_edge(
-            dep["from"],
-            dep["to"],
-            kind="service_dependency",
-            confidence=dep["confidence"],
-            last_verified=dep.get("last_verified", "2026-04-01T00:00:00Z"),
-        )
-
-    return G
-
-
-_GRAPH: nx.DiGraph | None = None
-
-
-def graph() -> nx.DiGraph:
-    """Lazy singleton."""
-    global _GRAPH
-    if _GRAPH is None:
-        _GRAPH = _build_graph()
-    return _GRAPH
-
-
-def affected_services(ci_ids: list[str]) -> list[dict]:
+def _check_system_heartbeat() -> bool:
     """
-    Given a list of CI ids, return the services they affect.
-
-    Each result includes a confidence score AND a freshness flag.
-    The agent uses both to decide whether to trust the answer.
+    Simulates an LPG (Labeled Property Graph) 'System Heartbeat' check.
+    Scans cmdb.json to ensure the target CI is online before allowing fulfillment.
+    Prevents "Operational Blindness" (Phase 01 risk).
     """
-    g = graph()
-    results = []
+    try:
+        with open(DATA_DIR / "cmdb.json") as f:
+            cmdb = json.load(f)
+            # If any CI in the infrastructure path is explicitly marked offline, fail the heartbeat
+            for ci in cmdb.get("cis", []):
+                if ci.get("status") == "offline":
+                    return False
+    except FileNotFoundError:
+        pass # If CMDB is missing, we fail open for testing, but in production this would fail closed.
+    return True
+
+def check_entitlement(user_id: str, item_id: str) -> dict:
+    """
+    Evaluates the 'Relationship' edges between User, Item, and Target CI.
+    Enforces strict Tier constraints, the 4-hour freshness rule, and CI health.
+    """
+    user = resolve_user(user_id)
+    item = resolve_catalog_item(item_id)
     now = datetime.now(timezone.utc)
 
-    for ci_id in ci_ids:
-        if ci_id not in g:
-            results.append({"ci_id": ci_id, "service_id": None, "confidence": 0.0, "fresh": False, "reason": "unknown_ci"})
-            continue
+    # 1. Entity Resolution Verification
+    if not user:
+        return {"authorized": False, "reason": "ERR-USER-NOT-FOUND", "tier": "Tier 2"}
+    if not item:
+        return {"authorized": False, "reason": "ERR-CATALOG-MISSING", "tier": "Tier 3"}
 
-        for _, svc_id, edge_data in g.out_edges(ci_id, data=True):
-            if edge_data["kind"] != "ci_to_service":
-                continue
+    # 2. Hard Freshness Check (The < 4 Hour Mandate)
+    last_verified_str = user.get("last_verified", "1970-01-01T00:00:00Z")
+    last_verified = datetime.fromisoformat(last_verified_str.replace("Z", "+00:00"))
+    
+    # Calculate age strictly in hours
+    age_hours = (now - last_verified).total_seconds() / 3600
+    
+    if age_hours > MAX_DATA_AGE_HOURS:
+        return {
+            "authorized": False, 
+            "confidence": 0.0, 
+            "reason": "ERR-IDENTITY-STALE", 
+            "tier": "Tier 2" # Identity fails route to HR verification
+        }
 
-            last_verified = datetime.fromisoformat(edge_data["last_verified"].replace("Z", "+00:00"))
-            age_days = (now - last_verified).days
-            fresh = age_days <= MAX_EDGE_AGE_DAYS
+    # 3. System Heartbeat (CI Health Verification)
+    if not _check_system_heartbeat():
+        return {
+            "authorized": False,
+            "confidence": 1.0,
+            "reason": "ERR-SYSTEM-OFFLINE",
+            "tier": "Tier 3" # Infrastructure fails route to Tech Support
+        }
 
-            results.append({
-                "ci_id": ci_id,
-                "service_id": svc_id,
-                "confidence": edge_data["confidence"],
-                "fresh": fresh,
-                "age_days": age_days,
-            })
+    # 4. Strict Entitlement (Tier Matching)
+    user_tier = user.get("tier", "non-critical")
+    allowed_tiers = item.get("allowed_service_tiers", [])
+    has_entitlement = user_tier in allowed_tiers
 
-    return results
+    if not has_entitlement:
+        return {
+            "authorized": False, 
+            "confidence": 1.0, 
+            "reason": "ERR-TIER-MISMATCH", 
+            "tier": "Tier 1" # Entitlement Auth fails are Immediate Denials
+        }
 
+    # 5. Role-Based Confidence Scoring (Persona Drift Defense)
+    user_role = user.get("role", "unknown")
+    confidence = 1.0
+    
+    # If the user is in a high-turnover or ambiguous role, lower confidence 
+    # to trigger mandatory human oversight in the harness.
+    if user_role == "Intern":
+        confidence *= 0.75  
 
-def downstream_services(service_id: str) -> list[dict]:
-    """Services that depend on this service."""
-    g = graph()
-    results = []
-    for src, _, edge_data in g.in_edges(service_id, data=True):
-        if edge_data["kind"] == "service_dependency":
-            results.append({"service_id": src, "confidence": edge_data["confidence"]})
-    return results
+    return {
+        "authorized": True,
+        "confidence": round(confidence, 2),
+        "fresh": True,
+        "context": {
+            "department": user.get("department", "unknown"),
+            "role": user_role
+        }
+    }
